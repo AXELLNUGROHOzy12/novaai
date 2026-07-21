@@ -37,7 +37,7 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 CHATGPT_MODEL = "gpt-4o-mini"
 CHATGPT_API_BASE = "https://api.openai.com/v1/chat/completions"
 
-BUILTIN_AI = ["gemini", "chatgpt", "dpsteai"]
+BUILTIN_AI = ["gemini", "chatgpt", "dpsteai", "gptfree"]
 
 # ── DPSTE AI (dipastebin.web.id) — punya session per-user sendiri ──
 DPSTE_HOST = "dipastebin.web.id"
@@ -152,6 +152,115 @@ def dpsteai_reset_session(session_id):
         except Exception:
             pass
     return dpste_id is not None
+
+# ── GPTFREE AI (gptfree-2 Firebase function) — token anon + histori per-user ──
+GPTFREE_API = "https://us-central1-gptfree-2.cloudfunctions.net/agent_stream"
+GPTFREE_FIREBASE_KEY = "AIzaSyBdU-Np8RSh1tPSsPOWg3qIm6PnVK5PQb4"
+GPTFREE_SESSION_FILE = os.path.join(DATA_DIR, "gptfree_sessions.json")
+_gptfree_lock = threading.Lock()
+
+def _gptfree_load_sessions():
+    try:
+        with open(GPTFREE_SESSION_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _gptfree_save_sessions(data):
+    try:
+        with open(GPTFREE_SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[GPTFREE] Gagal menyimpan sesi: {e}")
+
+def _gptfree_get_token(sess):
+    """Token anon Firebase, dicache di sesi selama masih berlaku >5 menit."""
+    now_ms = time.time() * 1000
+    if sess.get("token") and sess.get("expiresAt", 0) > now_ms + 5 * 60 * 1000:
+        return sess["token"]
+
+    payload = json.dumps({"returnSecureToken": True}).encode()
+    req = urllib.request.Request(
+        f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={GPTFREE_FIREBASE_KEY}",
+        data=payload, method="POST", headers=_dpste_headers(),
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    sess["token"] = data["idToken"]
+    sess["expiresAt"] = now_ms + int(data.get("expiresIn", 3600)) * 1000
+    return sess["token"]
+
+def call_gptfree(messages, cfg, session_id):
+    """Histori percakapan gptfree disimpan per session_id, sama polanya
+    kayak dpsteai — tiap user/percakapan Nova punya ingatan sendiri di sisi gptfree."""
+    last_user = next((m["text"] for m in reversed(messages) if m["role"] == "user"), "")
+    if not last_user:
+        return None, "Tidak ada pesan untuk dikirim ke gptfree."
+
+    with _gptfree_lock:
+        sessions = _gptfree_load_sessions()
+        sess = sessions.get(session_id) or {"history": [], "token": None, "expiresAt": 0}
+
+    try:
+        token = _gptfree_get_token(sess)
+    except urllib.error.HTTPError as e:
+        return None, f"Gagal ambil token gptfree ({e.code}): {e.read().decode()[:200]}"
+    except Exception as e:
+        return None, f"Gagal ambil token gptfree: {e}"
+
+    headers = {
+        **_dpste_headers(),
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/event-stream",
+    }
+    body = json.dumps({"message": last_user, "images": [], "history": sess["history"]}).encode()
+    req = urllib.request.Request(GPTFREE_API, data=body, method="POST", headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        return None, f"GPTFree error {e.code}: {e.read().decode()[:200]}"
+    except Exception as e:
+        return None, str(e)
+
+    answer = ""
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[len("data:"):].strip()
+        if not chunk:
+            continue
+        try:
+            parsed = json.loads(chunk)
+        except Exception:
+            continue
+        if parsed.get("response"):
+            answer += parsed["response"]
+
+    if not answer:
+        return None, "GPTFree tidak menghasilkan balasan."
+
+    sess["history"].append({"type": "user", "content": last_user})
+    sess["history"].append({"type": "agent", "content": answer})
+
+    with _gptfree_lock:
+        sessions = _gptfree_load_sessions()
+        sessions[session_id] = sess
+        _gptfree_save_sessions(sessions)
+
+    return answer, None
+
+def gptfree_reset_session(session_id):
+    """Hapus histori & token gptfree punya satu user/session_id."""
+    with _gptfree_lock:
+        sessions = _gptfree_load_sessions()
+        existed = sessions.pop(session_id, None) is not None
+        if existed:
+            _gptfree_save_sessions(sessions)
+    return existed
 
 def get_all_providers(cfg):
     """Built-in + semua custom endpoint yang udah ditambahkan."""
@@ -489,6 +598,8 @@ def call_ai(messages, cfg, provider="gemini", session_id="default"):
         return call_gemini(messages, cfg)
     if provider == "dpsteai":
         return call_dpsteai(messages, cfg, session_id)
+    if provider == "gptfree":
+        return call_gptfree(messages, cfg, session_id)
     # Custom endpoint
     return call_custom(messages, cfg, provider)
 
@@ -718,14 +829,14 @@ class Handler(BaseHTTPRequestHandler):
                 # Kalau global_ai aktif, session_ai tidak berpengaruh — beri tahu user
                 if global_ai:
                     self._set_headers(200)
-                    labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI"}
+                    labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI", "gptfree": "GPTFree AI"}
                     label = labels.get(global_ai, global_ai)
                     self.wfile.write(json.dumps({
                         "reply": f"⚠️ AI global sedang aktif: *{label}*. Hanya owner yang bisa mengganti."
                     }).encode())
                     return
                 session_ai[session_id] = provider
-                labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI"}
+                labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI", "gptfree": "GPTFree AI"}
                 label = labels.get(provider, provider)
                 self._set_headers(200)
                 self.wfile.write(json.dumps({"reply": f"🤖 AI diganti ke {label}!"}).encode())
@@ -883,7 +994,7 @@ class Handler(BaseHTTPRequestHandler):
             global_ai = provider
             config["global_ai"] = provider
             save_config(config)
-            labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI"}
+            labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI", "gptfree": "GPTFree AI"}
             label  = labels.get(provider, provider)
             self._set_headers(200)
             self.wfile.write(json.dumps({
@@ -914,7 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
                 }).encode())
                 return
             global_ai = provider
-            labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI"}
+            labels = {"gemini": "Gemini 2.5 Flash", "chatgpt": "ChatGPT (GPT-4o mini)", "dpsteai": "DPSTE AI", "gptfree": "GPTFree AI"}
             label = labels.get(provider, provider)
             self._set_headers(200)
             self.wfile.write(json.dumps({
