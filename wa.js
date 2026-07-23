@@ -222,6 +222,14 @@ const loadPlugins = async () => {
 }
 await loadPlugins()
 
+// Diekspos ke global biar plugin lain (misal /addplugin) bisa nulis file baru
+// ke folder plugins/ terus langsung aktifin tanpa perlu restart proses.
+// CATATAN: import ES Module di-cache Node per-URL — ini cuma jalan buat file
+// yang BENERAN BARU (belum pernah ke-import sebelumnya). Nimpa file yang
+// plugin-nya udah pernah dimuat tetap butuh restart proses.
+global.__novaReloadPlugins = loadPlugins
+global.__novaPluginDir = pluginDir
+
 // ── Main Bot Connection ──
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(WA_AUTH_DIR)
